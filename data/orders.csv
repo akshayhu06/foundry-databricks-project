@@ -1,0 +1,6 @@
+"order_id,customer_id,amount,status"
+"1,101,500,completed"
+"2,102,300,pending"
+"3,103,900,completed"
+"4,104,250,completed"
+"5,105,700,cancelled"
