@@ -1,0 +1,256 @@
+import uuid
+from pyspark.sql.functions import (
+    lit,
+    current_timestamp,
+    col,
+    sum,
+    count
+)
+
+catalog_name = "workspace"
+schema_name  = "foundry_demo"
+
+database = f"{catalog_name}.{schema_name}"
+
+run_id = str(uuid.uuid4())
+job_name = "orders_pipeline"
+
+# In real production get from Git job params
+git_commit = "abc123def456"
+branch = "main"
+
+
+spark.sql(f"""
+CREATE SCHEMA IF NOT EXISTS {database}
+""")
+
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {database}.pipeline_runs (
+    run_id STRING,
+    job_name STRING,
+    git_commit STRING,
+    branch STRING,
+    start_time TIMESTAMP,
+    end_time TIMESTAMP,
+    status STRING
+)
+""")
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {database}.dataset_versions (
+    table_name STRING,
+    version BIGINT,
+    run_id STRING,
+    created_at TIMESTAMP
+)
+""")
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {database}.lineage_edges (
+    output_table STRING,
+    input_table STRING,
+    input_version BIGINT,
+    run_id STRING
+)
+""")
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {database}.data_quality_results (
+    run_id STRING,
+    table_name STRING,
+    check_name STRING,
+    status STRING,
+    checked_at TIMESTAMP
+)
+""")
+
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {database}.bronze_orders (
+    order_id INT,
+    customer_id INT,
+    amount DOUBLE,
+    status STRING
+)
+""")
+
+# Insert sample data if table empty
+if spark.table(f"{database}.bronze_orders").count() == 0:
+    spark.sql(f"""
+    INSERT INTO {database}.bronze_orders VALUES
+    (1,101,500,'completed'),
+    (2,102,300,'pending'),
+    (3,103,900,'completed'),
+    (4,104,250,'completed'),
+    (5,105,700,'cancelled')
+    """)
+
+
+spark.sql(f"""
+INSERT INTO {database}.pipeline_runs
+VALUES (
+    '{run_id}',
+    '{job_name}',
+    '{git_commit}',
+    '{branch}',
+    current_timestamp(),
+    NULL,
+    'RUNNING'
+)
+""")
+
+try:
+
+
+    bronze_df = spark.read.table(f"{database}.bronze_orders")
+
+    input_version = (
+        spark.sql(f"DESCRIBE HISTORY {database}.bronze_orders")
+        .select("version")
+        .first()[0]
+    )
+
+
+    # Null check
+    null_count = bronze_df.filter(col("order_id").isNull()).count()
+
+    status_flag = "PASS" if null_count == 0 else "FAIL"
+
+    spark.sql(f"""
+    INSERT INTO {database}.data_quality_results
+    VALUES (
+        '{run_id}',
+        'bronze_orders',
+        'null_order_id_check',
+        '{status_flag}',
+        current_timestamp()
+    )
+    """)
+
+    if status_flag == "FAIL":
+        raise Exception("Null order_id found")
+
+    # Duplicate check
+    dup_count = (
+        bronze_df.groupBy("order_id")
+        .count()
+        .filter(col("count") > 1)
+        .count()
+    )
+
+    status_flag = "PASS" if dup_count == 0 else "FAIL"
+
+    spark.sql(f"""
+    INSERT INTO {database}.data_quality_results
+    VALUES (
+        '{run_id}',
+        'bronze_orders',
+        'duplicate_order_id_check',
+        '{status_flag}',
+        current_timestamp()
+    )
+    """)
+
+    if status_flag == "FAIL":
+        raise Exception("Duplicate order_id found")
+
+
+    silver_df = (
+        bronze_df
+        .filter(col("status") == "completed")
+        .withColumn("run_id", lit(run_id))
+        .withColumn("git_commit", lit(git_commit))
+        .withColumn("processed_at", current_timestamp())
+    )
+
+    silver_df.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .saveAsTable(f"{database}.silver_orders")
+
+    silver_version = (
+        spark.sql(f"DESCRIBE HISTORY {database}.silver_orders")
+        .select("version")
+        .first()[0]
+    )
+
+    spark.sql(f"""
+    INSERT INTO {database}.dataset_versions
+    VALUES (
+        'silver_orders',
+        {silver_version},
+        '{run_id}',
+        current_timestamp()
+    )
+    """)
+
+    spark.sql(f"""
+    INSERT INTO {database}.lineage_edges
+    VALUES (
+        'silver_orders',
+        'bronze_orders',
+        {input_version},
+        '{run_id}'
+    )
+    """)
+
+
+    gold_df = (
+        silver_df.groupBy("customer_id")
+        .agg(
+            sum("amount").alias("total_sales"),
+            count("*").alias("total_orders")
+        )
+        .withColumn("run_id", lit(run_id))
+    )
+
+    gold_df.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .saveAsTable(f"{database}.gold_customer_sales")
+
+    gold_version = (
+        spark.sql(f"DESCRIBE HISTORY {database}.gold_customer_sales")
+        .select("version")
+        .first()[0]
+    )
+
+    spark.sql(f"""
+    INSERT INTO {database}.dataset_versions
+    VALUES (
+        'gold_customer_sales',
+        {gold_version},
+        '{run_id}',
+        current_timestamp()
+    )
+    """)
+
+    spark.sql(f"""
+    INSERT INTO {database}.lineage_edges
+    VALUES (
+        'gold_customer_sales',
+        'silver_orders',
+        {silver_version},
+        '{run_id}'
+    )
+    """)
+
+    spark.sql(f"""
+    UPDATE {database}.pipeline_runs
+    SET end_time = current_timestamp(),
+        status = 'SUCCESS'
+    WHERE run_id = '{run_id}'
+    """)
+
+except Exception as e:
+
+
+    spark.sql(f"""
+    UPDATE {database}.pipeline_runs
+    SET end_time = current_timestamp(),
+        status = 'FAILED'
+    WHERE run_id = '{run_id}'
+    """)
+
+    raise e
